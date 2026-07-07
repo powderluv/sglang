@@ -275,6 +275,10 @@ jobs:
           run_pytest docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_torch_defaults_reset.py
           exit $failures
 
+      - name: Stop CI container
+        if: always()
+        run: bash scripts/ci/amd/amd_ci_stop_container.sh
+
   sgl-kernel-unit-test-2-gpu-amd:
     name: ${{ format('sgl-kernel-unit-test-2-gpu-amd (linux-{0}-2gpu-sglang)', inputs.runner_arch || 'mi325') }}
     needs: [check-changes, call-gate]
@@ -313,6 +317,10 @@ jobs:
           CONTINUE_ON_ERROR: ${{ needs.check-changes.outputs.continue_on_error }}
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite sgl-kernel-unit-test-2-gpu-amd ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+
+      - name: Stop CI container
+        if: always()
+        run: bash scripts/ci/amd/amd_ci_stop_container.sh
 
   # =============================================== primary ====================================================
 
@@ -353,6 +361,10 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-a-test-1-gpu-small-amd ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
+      - name: Stop CI container
+        if: always()
+        run: bash scripts/ci/amd/amd_ci_stop_container.sh
+
   jit-kernel-unit-test-amd:
     name: ${{ format('jit-kernel-unit-test-amd (linux-{0}-1gpu-sglang)', inputs.runner_arch || 'mi325') }}
     needs: [check-changes, call-gate]
@@ -389,6 +401,10 @@ jobs:
         timeout-minutes: 30
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite jit-kernel-unit-test-amd ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+
+      - name: Stop CI container
+        if: always()
+        run: bash scripts/ci/amd/amd_ci_stop_container.sh
 
   # =============================================== Wait Jobs for Sequential PR Execution ====================================================
   # These jobs poll GitHub API to wait for previous stages to complete.
@@ -456,6 +472,10 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 14 --timeout-per-file 2400 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
+      - name: Stop CI container
+        if: always()
+        run: bash scripts/ci/amd/amd_ci_stop_container.sh
+
   stage-b-test-1-gpu-small-amd-nondeterministic:
     name: ${{ format('stage-b-test-1-gpu-small-amd-nondeterministic (linux-{0}-1gpu-sglang)', inputs.runner_arch || 'mi325') }}
     needs: [check-changes, wait-for-stage-a-amd]
@@ -491,6 +511,10 @@ jobs:
         timeout-minutes: 75
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-nondeterministic --timeout-per-file 3600 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+
+      - name: Stop CI container
+        if: always()
+        run: bash scripts/ci/amd/amd_ci_stop_container.sh
 
   stage-b-test-1-gpu-small-amd-mi35x:
     needs: [check-changes, wait-for-stage-a-amd]
@@ -530,6 +554,10 @@ jobs:
         timeout-minutes: 30
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-mi35x ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+
+      - name: Stop CI container
+        if: always()
+        run: bash scripts/ci/amd/amd_ci_stop_container.sh
 
   stage-b-test-1-gpu-large-amd:
     name: ${{ format('stage-b-test-1-gpu-large-amd (linux-{0}-1gpu-sglang, {1})', inputs.runner_arch || 'mi325', matrix.part) }}
@@ -571,6 +599,10 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 2700 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
+      - name: Stop CI container
+        if: always()
+        run: bash scripts/ci/amd/amd_ci_stop_container.sh
+
   stage-b-test-2-gpu-large-amd:
     name: ${{ format('stage-b-test-2-gpu-large-amd (linux-{0}-2gpu-sglang, {1})', inputs.runner_arch || 'mi325', matrix.part) }}
     needs: [check-changes, wait-for-stage-a-amd]
@@ -610,6 +642,10 @@ jobs:
         timeout-minutes: 45
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-2-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 2700 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+
+      - name: Stop CI container
+        if: always()
+        run: bash scripts/ci/amd/amd_ci_stop_container.sh
 
   multimodal-gen-test-1-gpu-amd:
     name: ${{ format('multimodal-gen-test-1-gpu-amd (linux-{0}-1gpu-sglang, {1})', inputs.runner_arch || 'mi325', matrix.part) }}
@@ -751,6 +787,10 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      - name: Stop CI container
+        if: always()
+        run: bash scripts/ci/amd/amd_ci_stop_container.sh
+
   multimodal-gen-test-2-gpu-amd:
     name: ${{ format('multimodal-gen-test-2-gpu-amd (linux-{0}-2gpu-sglang, {1})', inputs.runner_arch || 'mi325', matrix.part) }}
     needs: [check-changes, call-gate]
@@ -889,6 +929,10 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      - name: Stop CI container
+        if: always()
+        run: bash scripts/ci/amd/amd_ci_stop_container.sh
+
 
   wait-for-stage-b-amd:
     needs: [check-changes, call-gate, wait-for-stage-a-amd]
@@ -972,6 +1016,10 @@ jobs:
               --retry-timeout-increase 0 \
               ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
+      - name: Stop CI container
+        if: always()
+        run: bash scripts/ci/amd/amd_ci_stop_container.sh
+
   stage-c-test-large-8-gpu-amd:
     name: ${{ format('stage-c-test-large-8-gpu-amd (linux-{0}-8gpu-sglang, {1})', inputs.runner_arch || 'mi325', matrix.part) }}
     needs: [check-changes, call-gate, wait-for-stage-b-amd]
@@ -1020,6 +1068,10 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 --timeout-per-file 5400 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
+      - name: Stop CI container
+        if: always()
+        run: bash scripts/ci/amd/amd_ci_stop_container.sh
+
   stage-c-test-large-8-gpu-amd-mi35x:
     needs: [check-changes, call-gate, wait-for-stage-b-amd]
     if: |
@@ -1059,6 +1111,10 @@ jobs:
         timeout-minutes: 60
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3600 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+
+      - name: Stop CI container
+        if: always()
+        run: bash scripts/ci/amd/amd_ci_stop_container.sh
 
   # =============================================== Disaggregation ====================================================
   stage-b-test-large-8-gpu-mi35x-disaggregation-amd:
@@ -1193,6 +1249,10 @@ jobs:
             -e MC_LOG_LEVEL=TRACE \
             -e GLOG_logtostderr=1 \
             -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-mi35x-disaggregation-amd --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+
+      - name: Stop CI container
+        if: always()
+        run: bash scripts/ci/amd/amd_ci_stop_container.sh
 
   pr-test-amd-finish:
     needs:
