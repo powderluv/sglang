@@ -1,0 +1,14 @@
+name: ARC GPU Check
+on:
+  workflow_dispatch: {}
+jobs:
+  gpu-check:
+    runs-on: linux-mi35x-gpu-1
+    steps:
+      - name: runner + dind + GPU via device passthrough
+        run: |
+          echo "runner host: $(hostname)"
+          docker version --format "dind server: {{.Server.Version}}"
+          echo "--- rocminfo inside a ROCm container launched via dind ---"
+          docker run --rm --device=/dev/kfd --device=/dev/dri --group-add 44 --group-add 992 \
+            rocm/rocm-terminal bash -lc "rocminfo | grep -E \"Name:.*gfx\" | head -3"
