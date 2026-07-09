@@ -6,11 +6,11 @@ jobs:
     runs-on: linux-mi35x-gpu-1
     steps:
       - uses: actions/checkout@v4
-      - name: Clear VRAM
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+      - name: Clear VRAM (tolerant — ephemeral runner has no host rocm-smi; real work is in ci_sglang)
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm || echo "vram-clear best-effort skipped"
       - name: Start ROCm container (mi35x, bypass LOCAL_DOCKER_REGISTRY)
         run: bash scripts/ci/amd/amd_ci_start_container.sh --custom-image lmsysorg/sglang:v0.5.14-rocm700-mi35x
-      - name: Assert GPU arch = gfx950
+      - name: Assert GPU arch = gfx950 (inside ci_sglang)
         run: bash scripts/ci/amd/amd_ci_exec.sh rocminfo | grep -q gfx950 && echo "gfx950 confirmed in ci_sglang"
       - name: Install deps
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
