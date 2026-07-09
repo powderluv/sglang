@@ -118,12 +118,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.nccl_port = nccl_port
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
-        self._need_mamba_verify_commit = (
-            self.model_runner.mambaish_config is not None
-            and hasattr(
-                self.model_runner.attn_backend, "update_mamba_state_after_mtp_verify"
-            )
-        )
+        self._need_mamba_verify_commit: Optional[bool] = None
         self.page_size = server_args.page_size
         # Normalized in arg_groups.speculative_hook.handle_speculative_decoding.
         self.draft_window_size: Optional[int] = (
@@ -286,6 +281,19 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def init_attention_backends(self):
         self._draft_worker.init_attention_backends()
+        self._need_mamba_verify_commit = (
+            self.model_runner.mambaish_config is not None
+            and hasattr(
+                self.model_runner.attn_backend,
+                "update_mamba_state_after_mtp_verify",
+            )
+        )
+
+    def _needs_mamba_verify_commit(self) -> bool:
+        assert (
+            self._need_mamba_verify_commit is not None
+        ), "_needs_mamba_verify_commit called before init_attention_backends"
+        return self._need_mamba_verify_commit
 
     def init_cuda_graphs(self):
         capture_decode_cuda_graph = (
@@ -1108,7 +1116,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         cache per-step intermediate states. After acceptance, we need to commit the
         state corresponding to each request's last accepted step.
         """
-        if not self._need_mamba_verify_commit:
+        if not self._needs_mamba_verify_commit():
             return
         attn_backend = self.target_worker.model_runner.attn_backend
 
@@ -1539,8 +1547,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.out_cache_loc = verify_out_cache_loc
         sampling_info = batch.sampling_info
 
+        need_mamba_verify_commit = self._needs_mamba_verify_commit()
         seq_lens_pre_verify = (
-            batch.seq_lens.clone() if self._need_mamba_verify_commit else None
+            batch.seq_lens.clone() if need_mamba_verify_commit else None
         )
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
@@ -1660,7 +1669,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                 )
 
-        if self._need_mamba_verify_commit:
+        if need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             self._update_target_mamba_state_after_verify(
                 batch=batch,
