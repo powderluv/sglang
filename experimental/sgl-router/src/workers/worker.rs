@@ -273,6 +273,13 @@ pub struct Worker {
     /// can upgrade it in place once the engine is ready. See
     /// [`crate::workers::manager`].
     protocol: AtomicU8,
+    /// The engine's `max_req_input_len` (tokens) from `/server_info`
+    /// introspection — the exact input-length bound its scheduler rejects
+    /// at. Interior-mutable for the same reason as `protocol`: a worker
+    /// that transiently failed introspection starts at 0 (= unknown; the
+    /// router's fail-fast length check skips it) and a re-introspection
+    /// fills it in place. See [`crate::workers::manager`].
+    max_req_input_len: AtomicU64,
     pub model_ids: Vec<ModelId>,
     pub breaker: Arc<CircuitBreaker>,
     pub active_requests: Arc<AtomicUsize>,
@@ -318,6 +325,8 @@ impl Worker {
             // `set_protocol` from `/server_info` introspection before (and on
             // reconcile, after) the worker becomes routable.
             protocol: AtomicU8::new(WireProtocol::default().as_u8()),
+            // 0 = unknown until `/server_info` introspection discloses it.
+            max_req_input_len: AtomicU64::new(0),
             model_ids: spec.model_ids,
             breaker,
             active_requests,
@@ -372,6 +381,29 @@ impl Worker {
     /// `active_requests` + breaker state).
     pub fn set_protocol(&self, p: WireProtocol) {
         self.protocol.store(p.as_u8(), Ordering::Relaxed);
+    }
+
+    /// The engine's input-length bound in tokens, or `None` while
+    /// introspection hasn't disclosed it (0 is the unknown sentinel — a
+    /// real engine bound is in practice never 0).
+    pub fn max_req_input_len(&self) -> Option<u64> {
+        match self.max_req_input_len.load(Ordering::Relaxed) {
+            0 => None,
+            n => Some(n),
+        }
+    }
+
+    /// Record the introspected `max_req_input_len`. Ignoring 0 (the
+    /// unknown sentinel) is defense-in-depth against a future caller
+    /// passing an unvalidated value — today's only production caller
+    /// (`manager::register_one`) already gates on `Some(n)`, and a
+    /// re-registration rebuilds the `Worker` at 0 regardless, so the
+    /// real freshness guarantee is the manager re-stamping after every
+    /// introspection, not this guard.
+    pub fn set_max_req_input_len(&self, n: u64) {
+        if n > 0 {
+            self.max_req_input_len.store(n, Ordering::Relaxed);
+        }
     }
 
     pub fn active_load(&self) -> usize {

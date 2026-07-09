@@ -57,6 +57,20 @@ pub struct ServerInfo {
     /// field) ⇒ stay on HTTP/1.1. Consumed by `manager::register_one` to set
     /// [`crate::workers::WireProtocol`].
     pub enable_http2: Option<bool>,
+    /// The engine's `max_req_input_len` (tokens) from `/server_info` —
+    /// the exact input-length bound its scheduler rejects at
+    /// (`validate_input_length`; the engine derives it with its own
+    /// headroom below context_len / KV-pool size). `None` on older SGLang
+    /// versions or failed introspection; the router's fail-fast length
+    /// check skips such workers when computing the fleet bound.
+    pub max_req_input_len: Option<u64>,
+    /// `ServerArgs.allow_auto_truncate`. `Some(true)` ⇒ the engine
+    /// TRUNCATES over-length inputs and serves them instead of rejecting —
+    /// so its `max_req_input_len` must NOT feed the router's fail-fast
+    /// rejection gate (the gate would 400 requests this engine would have
+    /// served). The worker manager skips stamping the bound for such
+    /// workers.
+    pub allow_auto_truncate: Option<bool>,
 }
 
 /// PD classification derived from a worker's `/server_info` response.
@@ -152,6 +166,8 @@ impl WorkerIntrospector {
             event_config,
             disaggregation_role,
             enable_http2: parsed.enable_http2,
+            max_req_input_len: parsed.max_req_input_len,
+            allow_auto_truncate: parsed.allow_auto_truncate,
         }
     }
 
@@ -343,6 +359,16 @@ struct ServerInfoBody {
     /// versions that predate the flag.
     #[serde(default)]
     enable_http2: Option<bool>,
+    /// Top-level `max_req_input_len` — the input-length bound the
+    /// engine's scheduler enforces (derived engine-side with its own
+    /// headroom below context_len / KV-pool size). Absent on older
+    /// SGLang versions.
+    #[serde(default)]
+    max_req_input_len: Option<u64>,
+    /// `ServerArgs.allow_auto_truncate` — when true the engine truncates
+    /// over-length inputs instead of rejecting them.
+    #[serde(default)]
+    allow_auto_truncate: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -430,6 +456,44 @@ mod tests {
             cfg.is_bigram,
             "EAGLE worker via the introspector must set is_bigram"
         );
+    }
+
+    /// `max_req_input_len` flows from `/server_info` into `ServerInfo` —
+    /// the value the router's fail-fast context-length gate mirrors. An
+    /// engine that doesn't disclose it (older SGLang) yields `None`, which
+    /// disables the gate for that worker rather than guessing a bound.
+    #[tokio::test]
+    async fn fetch_parses_max_req_input_len() {
+        let (url, _shutdown) = spawn_fake_worker(json!({
+            "served_model_name": "m",
+            "max_req_input_len": 1_048_570u64,
+        }))
+        .await;
+        let info = fast_introspector().fetch(&url).await;
+        assert_eq!(info.max_req_input_len, Some(1_048_570));
+
+        let (url, _shutdown) = spawn_fake_worker(json!({
+            "served_model_name": "m",
+        }))
+        .await;
+        let info = fast_introspector().fetch(&url).await;
+        assert_eq!(
+            info.max_req_input_len, None,
+            "absent field must resolve to None (gate disabled), not a guess"
+        );
+        assert_eq!(info.allow_auto_truncate, None);
+
+        // A truncating engine discloses both; the manager (not this layer)
+        // decides the bound must not arm the rejection gate.
+        let (url, _shutdown) = spawn_fake_worker(json!({
+            "served_model_name": "m",
+            "max_req_input_len": 7u64,
+            "allow_auto_truncate": true,
+        }))
+        .await;
+        let info = fast_introspector().fetch(&url).await;
+        assert_eq!(info.max_req_input_len, Some(7));
+        assert_eq!(info.allow_auto_truncate, Some(true));
     }
 
     /// A non-speculative worker (no `speculative_algorithm`) must NOT be bigram.

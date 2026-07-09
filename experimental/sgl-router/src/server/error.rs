@@ -62,6 +62,23 @@ pub enum ApiError {
     #[error("bad request: {0}")]
     BadRequest(String),
 
+    /// The ingress-tokenized INPUT exceeds the engine's introspected
+    /// input-length bound (`max_tokens` is deliberately not added — the
+    /// engine's separate total-tokens check is not mirrored here, and
+    /// OpenAI words that variant differently). Rejected at the router so
+    /// the client fails in milliseconds instead of paying a dispatch —
+    /// plus, for non-forwarded prompts, an engine-side tokenize — for the
+    /// same over-long prompt; the engine's own validation remains the
+    /// authoritative backstop. Message follows OpenAI's
+    /// `context_length_exceeded` wording so SDK error handling written
+    /// against OpenAI keeps working.
+    #[error(
+        "This model's maximum context length is {limit} tokens. However, your \
+         messages resulted in {input_tokens} tokens. Please reduce the length \
+         of the messages."
+    )]
+    ContextLengthExceeded { limit: u64, input_tokens: u64 },
+
     #[error("model not found: {0}")]
     ModelNotFound(String),
 
@@ -176,6 +193,7 @@ impl ApiError {
     fn class(&self) -> ErrorClass {
         match self {
             ApiError::BadRequest(_) => ErrorClass::BadRequest,
+            ApiError::ContextLengthExceeded { .. } => ErrorClass::BadRequest,
             ApiError::ModelNotFound(_) => ErrorClass::NotFound,
             ApiError::UpstreamUnreachable { .. } => ErrorClass::Upstream,
             ApiError::UpstreamStatus { .. } => ErrorClass::Upstream,
@@ -199,6 +217,9 @@ impl ApiError {
     fn error_code(&self) -> &'static str {
         match self {
             ApiError::BadRequest(_) => "bad_request",
+            // OpenAI's exact machine-readable code for this failure —
+            // clients key retry/truncate logic on it.
+            ApiError::ContextLengthExceeded { .. } => "context_length_exceeded",
             ApiError::ModelNotFound(_) => "model_not_found",
             ApiError::UpstreamUnreachable { .. } => "upstream_unreachable",
             // Mid-body drop: headers (incl. a status) arrived, then the body
@@ -273,6 +294,7 @@ impl ApiError {
             | ApiError::WorkerMisconfigured { .. } => true,
             ApiError::UpstreamStatus { .. }
             | ApiError::BadRequest(_)
+            | ApiError::ContextLengthExceeded { .. }
             | ApiError::ModelNotFound(_)
             | ApiError::NoHealthyWorkers { .. }
             | ApiError::NoPrefillWorkersAvailable { .. }
@@ -294,6 +316,7 @@ impl ApiError {
         match self {
             ApiError::UpstreamStatus { status } => Some(*status),
             ApiError::BadRequest(_)
+            | ApiError::ContextLengthExceeded { .. }
             | ApiError::ModelNotFound(_)
             | ApiError::UpstreamUnreachable { .. }
             | ApiError::UpstreamTimeout { .. }
@@ -321,6 +344,14 @@ struct ErrorBody<'a> {
     typ: &'static str,
     code: &'a str,
     message: String,
+    /// The offending request parameter, when one is identifiable —
+    /// OpenAI's error envelope commonly carries it (`"messages"` for
+    /// `context_length_exceeded`; nullable in the wild, and SDKs type it
+    /// optional, so sending a non-null value is always safe). Omitted
+    /// (not null) when unknown, so existing consumers of the envelope
+    /// see no change on other errors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    param: Option<&'static str>,
 }
 
 impl IntoResponse for ApiError {
@@ -407,12 +438,23 @@ impl IntoResponse for ApiError {
                 tracing::warn!(model = %model, reason = "service_overloaded", "shedding request: all workers at capacity and wait queue full");
                 "service overloaded".to_string()
             }
-            ApiError::BadRequest(_) | ApiError::ModelNotFound(_) => self.to_string(),
+            ApiError::BadRequest(_)
+            | ApiError::ContextLengthExceeded { .. }
+            | ApiError::ModelNotFound(_) => self.to_string(),
+        };
+        let param = match &self {
+            ApiError::ContextLengthExceeded { .. } => Some("messages"),
+            _ => None,
         };
         let mut resp = (
             status,
             Json(ErrorEnvelope {
-                error: ErrorBody { typ, code, message },
+                error: ErrorBody {
+                    typ,
+                    code,
+                    message,
+                    param,
+                },
             }),
         )
             .into_response();
@@ -460,6 +502,8 @@ mod tests {
         typ: String,
         code: String,
         message: String,
+        #[serde(default)]
+        param: Option<String>,
     }
 
     fn parse_envelope(resp: Response) -> (StatusCode, Option<String>, ErrEnv) {
@@ -473,6 +517,47 @@ mod tests {
         let env: ErrEnv = serde_json::from_str(&body_str)
             .unwrap_or_else(|e| panic!("envelope did not match expected shape: {e}: {body_str}"));
         (status, code_header, env)
+    }
+
+    /// Pin the OpenAI `context_length_exceeded` contract end to end:
+    /// HTTP 400, `error.type = invalid_request_error`,
+    /// `error.code = "context_length_exceeded"` (the machine-readable
+    /// string OpenAI SDKs key truncate-and-retry logic on),
+    /// `error.param = "messages"`, and OpenAI's message wording with the
+    /// real numbers. Any drift here breaks clients written against
+    /// OpenAI's SDK conventions.
+    #[test]
+    fn context_length_exceeded_matches_openai_contract() {
+        let (status, code_header, env) = parse_envelope(
+            ApiError::ContextLengthExceeded {
+                limit: 1_048_570,
+                input_tokens: 1_081_333,
+            }
+            .into_response(),
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code_header.as_deref(), Some("context_length_exceeded"));
+        assert_eq!(env.error.typ, "invalid_request_error");
+        assert_eq!(env.error.code, "context_length_exceeded");
+        assert_eq!(env.error.param.as_deref(), Some("messages"));
+        assert_eq!(
+            env.error.message,
+            "This model's maximum context length is 1048570 tokens. However, \
+             your messages resulted in 1081333 tokens. Please reduce the \
+             length of the messages."
+        );
+    }
+
+    /// `param` is OMITTED (not null) on every other error, so pre-existing
+    /// envelope consumers see byte-identical bodies for them.
+    #[test]
+    fn param_field_omitted_on_other_errors() {
+        let resp = ApiError::BadRequest("nope".into()).into_response();
+        let body = collect_body(resp);
+        assert!(
+            !body.contains("param"),
+            "param must be absent (not null) on non-context-length errors: {body}"
+        );
     }
 
     #[test]

@@ -35,6 +35,9 @@
 //! | `sgl_router_decode_affinity_total` | Counter | `outcome` |
 //! | `sgl_router_sticky_total` | Counter | `outcome` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
+//! | `sgl_router_context_length_rejected_total` | Counter | `model_id` |
+//! | `sgl_router_context_length_gate` | Gauge | `state` |
+//! | `sgl_router_worker_max_req_input_len` | Gauge | `worker_url` |
 //! | `sgl_router_backpressure_rejected_total` | Counter | `model_id` |
 //! | `sgl_router_engine_aborts_total` | Counter | `reason` |
 //! | `sgl_router_retries_total` | Counter | `model_id` |
@@ -329,6 +332,7 @@ pub struct MetricsRegistry {
     decode_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
+    context_length_rejected_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
     backpressure_rejected_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
     /// Per-reason count of `/abort_request` POSTs the router has sent to
     /// engines. Fixed-length array indexed by [`AbortReason::as_index`], so
@@ -388,6 +392,7 @@ impl Default for MetricsRegistry {
             decode_affinity_total: Default::default(),
             sticky_total: Default::default(),
             ingress_tokenize_errors_total: Default::default(),
+            context_length_rejected_total: Default::default(),
             backpressure_rejected_total: Default::default(),
             engine_aborts_total: std::array::from_fn(|_| AtomicU64::new(0)),
             retries_total: Default::default(),
@@ -449,6 +454,10 @@ pub struct WorkerSnapshot {
     pub cb_state: u8,
     /// In-flight request count for this worker (`Worker::active_load`).
     pub inflight: i64,
+    /// The worker's introspected `max_req_input_len` (`None` = not
+    /// disclosed). Feeds the context-length gate-state + per-worker
+    /// bound gauges.
+    pub max_req_input_len: Option<u64>,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
@@ -726,6 +735,24 @@ impl MetricsRegistry {
     /// counted. Pairs with the per-occurrence WARN log in `tokenize_text`.
     pub fn record_ingress_tokenize_error(&self, model_id: &str) {
         let mut guard = self.ingress_tokenize_errors_total.lock();
+        let counter = guard
+            .entry(model_id.to_owned())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_context_length_rejected_total{model_id}` — a chat
+    /// request whose ingress-tokenized input exceeded the engines'
+    /// introspected `max_req_input_len` and was rejected at the router
+    /// (OpenAI-shaped 400, `code=context_length_exceeded`) without ever
+    /// dispatching. The engine-side validation these requests would have
+    /// hit costs a full dispatch — plus, for prompts whose `input_ids`
+    /// would not have been forwarded, an engine-side tokenize; this
+    /// counter is the visibility that the fail-fast path absorbed them.
+    pub fn record_context_length_rejected(&self, model_id: &str) {
+        let mut guard = self.context_length_rejected_total.lock();
         let counter = guard
             .entry(model_id.to_owned())
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
@@ -1098,6 +1125,41 @@ impl MetricsRegistry {
             ));
         }
 
+        // context-length gate state + per-worker bounds. Two roles:
+        // the gate gauge renders BOTH states (selected = 1) so a
+        // dashboard can alert on "gate never armed" (all-unknown fleet)
+        // without an absent-series ambiguity — the rejected counter alone
+        // can't distinguish that from "no over-length traffic". The
+        // per-worker gauge (0 = worker hasn't disclosed a bound) gives
+        // ATTRIBUTION: the gate limit is a fleet-wide MIN, so when a
+        // rejection storm hits, min(sgl_router_worker_max_req_input_len>0)
+        // names the worker whose (possibly misconfigured) bound is
+        // binding.
+        let gate_active = workers.iter().any(|w| w.max_req_input_len.is_some());
+        out.push_str(
+            "# HELP sgl_router_context_length_gate Fail-fast context-length gate state; disabled means no worker has disclosed max_req_input_len (older SGLang, introspection pending, or an all---allow-auto-truncate fleet) and over-length requests flow to the engines' own validation.\n",
+        );
+        out.push_str("# TYPE sgl_router_context_length_gate gauge\n");
+        out.push_str(&format!(
+            "sgl_router_context_length_gate{{state=\"active\"}} {}\n",
+            u8::from(gate_active)
+        ));
+        out.push_str(&format!(
+            "sgl_router_context_length_gate{{state=\"disabled\"}} {}\n",
+            u8::from(!gate_active)
+        ));
+        out.push_str(
+            "# HELP sgl_router_worker_max_req_input_len Input-length bound each worker disclosed via /server_info (0 = not disclosed; truncating --allow-auto-truncate workers never disclose). The gate rejects at the minimum non-zero value.\n",
+        );
+        out.push_str("# TYPE sgl_router_worker_max_req_input_len gauge\n");
+        for w in &sorted {
+            out.push_str(&format!(
+                "sgl_router_worker_max_req_input_len{{worker_url=\"{}\"}} {}\n",
+                escape_label(&w.worker_url),
+                w.max_req_input_len.unwrap_or(0),
+            ));
+        }
+
         // stale_requests_total
         out.push_str(
             "# HELP sgl_router_stale_requests_total Total stale-request cancellations fired by the janitor.\n",
@@ -1169,6 +1231,26 @@ impl MetricsRegistry {
         for (model_id, value) in entries {
             out.push_str(&format!(
                 "sgl_router_ingress_tokenize_errors_total{{model_id=\"{}\"}} {}\n",
+                escape_label(model_id),
+                value,
+            ));
+        }
+        drop(guard);
+
+        // context_length_rejected_total
+        out.push_str(
+            "# HELP sgl_router_context_length_rejected_total Chat requests rejected at the router with an OpenAI-shaped 400 (code=context_length_exceeded) because their ingress-tokenized input exceeded the engines' introspected max_req_input_len — each one saved a dispatch (and, for non-forwarded prompts, an engine-side tokenize of the same over-long prompt). Pair with sgl_router_context_length_gate to distinguish 'no over-length traffic' from 'gate never armed'.\n",
+        );
+        out.push_str("# TYPE sgl_router_context_length_rejected_total counter\n");
+        let guard = self.context_length_rejected_total.lock();
+        let mut entries: Vec<(&String, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (model_id, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_context_length_rejected_total{{model_id=\"{}\"}} {}\n",
                 escape_label(model_id),
                 value,
             ));
@@ -1724,6 +1806,7 @@ mod tests {
                 healthy: true,
                 cb_state: 0,
                 inflight: 5,
+                max_req_input_len: None,
             },
             WorkerSnapshot {
                 worker_url: "http://d0:30000".into(),
@@ -1731,6 +1814,7 @@ mod tests {
                 healthy: false,
                 cb_state: 1,
                 inflight: 0,
+                max_req_input_len: None,
             },
         ];
         let out = reg.render_with_workers(&workers);
@@ -1751,6 +1835,68 @@ mod tests {
         assert!(
             out.contains(r#"sgl_router_worker_inflight_requests{worker_url="http://d0:30000"} 0"#)
         );
+        // Context-length gate: no worker disclosed a bound -> the disabled
+        // state renders EXPLICITLY (never absent-series-ambiguous), and the
+        // per-worker bound gauge renders 0 for undisclosed workers.
+        assert!(out.contains(r#"sgl_router_context_length_gate{state="active"} 0"#));
+        assert!(out.contains(r#"sgl_router_context_length_gate{state="disabled"} 1"#));
+        assert!(
+            out.contains(r#"sgl_router_worker_max_req_input_len{worker_url="http://p0:30000"} 0"#)
+        );
+    }
+
+    /// One disclosing worker arms the gate; the per-worker gauge exposes
+    /// each worker's bound so a fleet-wide-min rejection storm can be
+    /// attributed to the worker whose (possibly misconfigured) bound is
+    /// binding.
+    #[test]
+    fn render_with_workers_reports_context_length_gate_active() {
+        let reg = MetricsRegistry::new();
+        let workers = vec![
+            WorkerSnapshot {
+                worker_url: "http://a:30000".into(),
+                mode: "plain",
+                healthy: true,
+                cb_state: 0,
+                inflight: 0,
+                max_req_input_len: Some(1_048_570),
+            },
+            WorkerSnapshot {
+                worker_url: "http://b:30000".into(),
+                mode: "plain",
+                healthy: true,
+                cb_state: 0,
+                inflight: 0,
+                max_req_input_len: None,
+            },
+        ];
+        let out = reg.render_with_workers(&workers);
+        assert!(out.contains(r#"sgl_router_context_length_gate{state="active"} 1"#));
+        assert!(out.contains(r#"sgl_router_context_length_gate{state="disabled"} 0"#));
+        assert!(out.contains(
+            r#"sgl_router_worker_max_req_input_len{worker_url="http://a:30000"} 1048570"#
+        ));
+        assert!(
+            out.contains(r#"sgl_router_worker_max_req_input_len{worker_url="http://b:30000"} 0"#)
+        );
+    }
+
+    /// `sgl_router_context_length_rejected_total` follows the sibling
+    /// model_id-labelled counter contract: HELP/TYPE always render (empty
+    /// registry included), series appear per model once recorded.
+    #[test]
+    fn context_length_rejected_counter_increments_per_model() {
+        let reg = MetricsRegistry::new();
+        let empty = reg.render();
+        assert!(empty.contains("# TYPE sgl_router_context_length_rejected_total counter"));
+        assert!(!empty.contains("sgl_router_context_length_rejected_total{"));
+
+        reg.record_context_length_rejected("tiny");
+        reg.record_context_length_rejected("tiny");
+        reg.record_context_length_rejected("other");
+        let out = reg.render();
+        assert!(out.contains(r#"sgl_router_context_length_rejected_total{model_id="tiny"} 2"#));
+        assert!(out.contains(r#"sgl_router_context_length_rejected_total{model_id="other"} 1"#));
     }
 
     #[test]

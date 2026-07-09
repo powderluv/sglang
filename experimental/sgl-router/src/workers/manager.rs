@@ -508,6 +508,30 @@ async fn register_one(
     // protocol on the post-insert entry.
     if let Some(w) = registry.get(&worker_id) {
         w.set_protocol(protocol);
+        // Same post-insert pattern for the introspected input-length
+        // bound (the upsert resets it to unknown); `None` (older SGLang /
+        // failed introspection) leaves it unknown and the router's
+        // fail-fast length check skips this worker. Logged at info per
+        // stamp (registration-rate, like the protocol resolution above)
+        // because the bound feeds a fleet-wide MIN: when a rejection storm
+        // hits, the operator must be able to attribute the binding limit
+        // to the worker that disclosed it.
+        match (info.max_req_input_len, info.allow_auto_truncate) {
+            (Some(n), Some(true)) => {
+                // A truncating engine SERVES over-length inputs (cuts them
+                // to fit) — its bound must not arm the rejection gate or
+                // the router would 400 requests this engine would accept.
+                tracing::info!(worker_url = %worker_url, max_req_input_len = n,
+                    "worker runs --allow-auto-truncate; its input-length bound is NOT \
+                     used for fail-fast rejection");
+            }
+            (Some(n), _) => {
+                w.set_max_req_input_len(n);
+                tracing::info!(worker_url = %worker_url, max_req_input_len = n,
+                    "context-length gate: worker disclosed its input-length bound");
+            }
+            (None, _) => {}
+        }
     }
     if let Some(idx) = kv_index {
         // Pass the pre-resolved EventConfig so the KvEventIndex does
@@ -697,6 +721,104 @@ mod tests {
         .await;
         assert!(registered.is_ok(), "manager did not resolve model id");
 
+        drop(tx);
+        let _ = manager_handle.await;
+    }
+
+    /// The introspected `max_req_input_len` must be stamped onto the
+    /// registered Worker — this is the ONLY production wiring of the
+    /// fail-fast context-length gate; without it the gate is permanently
+    /// (and silently, fail-open) disabled. A worker running
+    /// `--allow-auto-truncate` must NOT be stamped: it truncates and
+    /// SERVES over-length inputs, so its bound arming the rejection gate
+    /// would 400 requests that engine would have accepted.
+    #[tokio::test]
+    async fn manager_stamps_max_req_input_len_except_for_auto_truncate() {
+        // Case 1: bound disclosed, no auto-truncate -> stamped.
+        let (worker_url, _shutdown) = spawn_fake_server_info_worker(json!({
+            "served_model_name": "m",
+            "max_req_input_len": 12345u64,
+        }))
+        .await;
+        let registry = Arc::new(WorkerRegistry::default());
+        let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+        let manager_handle = tokio::spawn(run_with_introspector(
+            rx,
+            registry.clone(),
+            None,
+            None,
+            None,
+            fast_introspector(),
+        ));
+        let spec = WorkerSpec {
+            id: WorkerId("w-len".into()),
+            url: worker_url,
+            mode: WorkerMode::Plain,
+            model_ids: Vec::new(),
+            bootstrap_port: None,
+        };
+        tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
+        let stamped = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(w) = registry.get(&spec.id) {
+                    if w.max_req_input_len() == Some(12345) {
+                        return true;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            stamped.is_ok(),
+            "manager did not stamp max_req_input_len from /server_info"
+        );
+        drop(tx);
+        let _ = manager_handle.await;
+
+        // Case 2: bound disclosed but allow_auto_truncate -> NOT stamped.
+        let (worker_url, _shutdown) = spawn_fake_server_info_worker(json!({
+            "served_model_name": "m",
+            "max_req_input_len": 12345u64,
+            "allow_auto_truncate": true,
+        }))
+        .await;
+        let registry = Arc::new(WorkerRegistry::default());
+        let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+        let manager_handle = tokio::spawn(run_with_introspector(
+            rx,
+            registry.clone(),
+            None,
+            None,
+            None,
+            fast_introspector(),
+        ));
+        let spec = WorkerSpec {
+            id: WorkerId("w-trunc".into()),
+            url: worker_url,
+            mode: WorkerMode::Plain,
+            model_ids: Vec::new(),
+            bootstrap_port: None,
+        };
+        tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
+        // Wait for registration (model id resolved), then confirm the
+        // bound stayed unknown.
+        let registered = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(w) = registry.get(&spec.id) {
+                    if w.model_ids.iter().any(|m| m.0 == "m") {
+                        return w.max_req_input_len();
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert_eq!(
+            registered.expect("worker registered"),
+            None,
+            "an --allow-auto-truncate worker's bound must not arm the rejection gate"
+        );
         drop(tx);
         let _ = manager_handle.await;
     }

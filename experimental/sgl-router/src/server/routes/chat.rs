@@ -41,13 +41,19 @@ use bytes::Bytes;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Sampling counter for the diagnostic `phase_*` timing logs below. Logs roughly
 /// 1-in-`PHASE_LOG_SAMPLE` requests so a steady flood doesn't drown the access
 /// log while still yielding a representative latency-phase breakdown.
 static PHASE_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Gates the context-length rejection log to first-WARN-then-DEBUG
+/// (`log_fallback`'s flood-control convention): over-length traffic is
+/// steady-state client behavior, not an incident, and it is already
+/// surfaced via the metric, the access log, and the response body.
+static CONTEXT_REJECT_WARNED: AtomicBool = AtomicBool::new(false);
 const PHASE_LOG_SAMPLE: u64 = 64;
 
 /// Observability header carrying the decode-pool URL selected via host
@@ -247,6 +253,52 @@ async fn chat_completions_inner(
             model = %model_str,
             "phase_pre_admit",
         );
+    }
+
+    // Fail-fast context-length gate. A non-truncating engine rejects an
+    // over-length input — the tokenizer manager's context_len check for
+    // far-over prompts, the scheduler's `validate_input_length` (against
+    // the tighter `max_req_input_len` this gate mirrors) for the band
+    // below it — but only after the router pays a full dispatch and, when
+    // `input_ids` aren't forwarded, the engine tokenizes the entire
+    // over-long prompt just to produce the 400 (~2s of engine CPU at 1M
+    // tokens, measured on deepseek-v4-flash-yan-huang-no-pd, 2026-07-09
+    // UTC). The router already holds the exact token count here, so
+    // mirror the engine's check and fail in milliseconds with OpenAI's
+    // `context_length_exceeded` contract instead.
+    //
+    // Fail-open by design: the limit is the fleet-minimum introspected
+    // bound (see `context_length_limit` for the min-vs-max trade-off;
+    // `--allow-auto-truncate` workers, which SERVE over-length inputs,
+    // are excluded at introspection time), engine-equivalent ids mirror
+    // the engine's `>=` check exactly, and raw-fallback counts only
+    // reject beyond a slack band (see `context_length_slack`). Everything
+    // that passes still hits the engine's own validation — the
+    // authoritative backstop.
+    if let (Some(tokens), Some(limit)) = (request_tokens.as_ref(), context_length_limit(&workers)) {
+        let input_tokens = tokens.ids.len() as u64;
+        let slack = context_length_slack(limit, tokens.engine_equivalent);
+        if input_tokens >= limit.saturating_add(slack) {
+            ctx.metrics.record_context_length_rejected(&model_str);
+            // First occurrence per process at WARN (the "this fleet has an
+            // over-length client" heads-up), steady state at DEBUG: the
+            // rejection is client-caused and already triple-surfaced (the
+            // metric, the access-logged 400, the response body), so a
+            // per-request WARN would flood journald at the measured 1.1%
+            // rate (log_fallback's first-warn convention).
+            if !CONTEXT_REJECT_WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(model = %model_str, input_tokens, limit,
+                    "rejecting over-context-length request at ingress \
+                     (code=context_length_exceeded; further rejections log at debug)");
+            } else {
+                tracing::debug!(model = %model_str, input_tokens, limit,
+                    "rejecting over-context-length request at ingress");
+            }
+            return Err(ApiError::ContextLengthExceeded {
+                limit,
+                input_tokens,
+            });
+        }
     }
 
     // Sticky-session routing key. When the sticky policy is configured,
@@ -1198,6 +1250,45 @@ fn build_outgoing_body(
     Ok(Bytes::from(bytes))
 }
 
+/// The effective input-length bound for this model: the MINIMUM
+/// `max_req_input_len` across the workers that have disclosed one via
+/// `/server_info` introspection (truncating `--allow-auto-truncate`
+/// workers never disclose — see `manager::register_one`). `None` when no
+/// worker has disclosed a bound (older SGLang, introspection still
+/// pending) — the fail-fast gate is then disabled and the engine's own
+/// validation is the only check, i.e. exactly the pre-gate behavior.
+///
+/// Min is a deliberate trade-off, not a safety proof: the router routes
+/// to ONE worker, so on a genuinely heterogeneous fleet (mixed KV-pool
+/// sizes for the same model) min rejects requests a roomier worker would
+/// have served, while max would admit requests the strictest worker
+/// rejects (harmless — that worker's own validation 400s them). Min buys
+/// a deterministic outcome independent of which worker routing picks;
+/// homogeneous fleets — the norm — make min == max and the question moot.
+fn context_length_limit(workers: &[Arc<Worker>]) -> Option<u64> {
+    workers.iter().filter_map(|w| w.max_req_input_len()).min()
+}
+
+/// Slack added to the limit before the ingress gate rejects. Zero for
+/// engine-equivalent ids — the router's count IS the engine's count, so
+/// the mirror is exact. `engine_equivalent = false` means the ids came
+/// from the raw-prompt fallback (model without a chat encoder, or
+/// `encode_chat` failed) whose count can drift from the engine's true
+/// render, so the gate only fires beyond a band wide enough that the
+/// drift can never false-reject: max(1024, limit/64) — ~1.6% of a
+/// 1M-token limit, still far below the over-length traffic this gate
+/// exists for. (Tools / multimodal requests on a chat-encoder model are
+/// NOT this case: their ids are engine-equivalent-flagged but UNDERCOUNT
+/// the engine's tools-inclusive render — an undercount can only fail
+/// open, so zero slack stays safe for them too.)
+fn context_length_slack(limit: u64, engine_equivalent: bool) -> u64 {
+    if engine_equivalent {
+        0
+    } else {
+        (limit / 64).max(1024)
+    }
+}
+
 /// Whether the router's `input_ids` may be forwarded for this request.
 ///
 /// We forward only when the engine, fed `input_ids`, would have produced the
@@ -1407,6 +1498,16 @@ mod tests {
                 AbortReason::TransportError,
             ),
             (
+                // Returned before any dispatch, so it can never reach an
+                // abort guard in practice — the default mapping is pinned
+                // anyway so the variant has a decided row.
+                ApiError::ContextLengthExceeded {
+                    limit: 10,
+                    input_tokens: 20,
+                },
+                AbortReason::TransportError,
+            ),
+            (
                 ApiError::ModelNotFound("m".into()),
                 AbortReason::TransportError,
             ),
@@ -1476,7 +1577,7 @@ mod tests {
         // variant. If someone adds a new variant without adding a row,
         // this count assertion catches it — a coarse but effective net.
         // Keep the expected count in sync with the ApiError enum.
-        const EXPECTED_APIERROR_VARIANTS: usize = 14;
+        const EXPECTED_APIERROR_VARIANTS: usize = 15;
         assert_eq!(
             cases.len(),
             EXPECTED_APIERROR_VARIANTS,
@@ -1934,5 +2035,61 @@ mod tests {
                     && l.contains(r#"outcome="error""#)),
             "a pre-routing 400 must be counted in worker_requests_total{{outcome=error}}; got:\n{metrics}"
         );
+    }
+
+    fn worker_with_bound(url: &str, bound: Option<u64>) -> Arc<Worker> {
+        let w = Arc::new(Worker::new(crate::discovery::WorkerSpec {
+            id: crate::discovery::WorkerId(url.into()),
+            url: url.into(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![],
+            bootstrap_port: None,
+        }));
+        if let Some(n) = bound {
+            w.set_max_req_input_len(n);
+        }
+        w
+    }
+
+    /// The gate's limit is the MINIMUM disclosed bound (a mixed fleet must
+    /// never admit what its strictest worker rejects); workers that haven't
+    /// disclosed one are skipped, and a fleet with none disables the gate.
+    #[test]
+    fn context_length_limit_is_min_of_disclosed_bounds() {
+        let all_unknown = [
+            worker_with_bound("http://a:1", None),
+            worker_with_bound("http://b:1", None),
+        ];
+        assert_eq!(context_length_limit(&all_unknown), None);
+
+        let mixed = [
+            worker_with_bound("http://a:1", None),
+            worker_with_bound("http://b:1", Some(2000)),
+            worker_with_bound("http://c:1", Some(1000)),
+        ];
+        assert_eq!(context_length_limit(&mixed), Some(1000));
+
+        assert_eq!(context_length_limit(&[]), None);
+    }
+
+    /// Engine-equivalent ids mirror the engine's check exactly (zero
+    /// slack); non-equivalent renders only reject beyond a band wide
+    /// enough that a few tokens of render drift can't false-reject.
+    #[test]
+    fn context_length_slack_zero_only_for_engine_equivalent() {
+        assert_eq!(context_length_slack(1_048_570, true), 0);
+        // Small limit: the 1024 floor dominates.
+        assert_eq!(context_length_slack(1000, false), 1024);
+        // Large limit: limit/64 dominates (~1.6%).
+        assert_eq!(context_length_slack(1_048_570, false), 1_048_570 / 64);
+    }
+
+    /// The setter's 0-sentinel guard: a (hypothetical future) caller
+    /// passing 0 must not erase a previously-disclosed bound.
+    #[test]
+    fn set_max_req_input_len_ignores_zero_sentinel() {
+        let w = worker_with_bound("http://a:1", Some(5));
+        w.set_max_req_input_len(0);
+        assert_eq!(w.max_req_input_len(), Some(5));
     }
 }
